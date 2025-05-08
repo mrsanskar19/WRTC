@@ -1,39 +1,84 @@
-// index.js
 const express = require('express');
 const http = require('http');
-const WebSocket = require('ws');
+const { Server } = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST'],
+  },
+});
 
-const rooms = new Map();
+const rooms = new Map(); // roomId -> Set of { socket, userId }
 
-wss.on('connection', (ws, req) => {
-  const url = new URL(req.url, 'http://localhost');
-  const roomId = url.searchParams.get('room');
+io.on('connection', (socket) => {
+  console.log(`New connection: ${socket.id}`);
 
-  if (!roomId) {
-    ws.close();
-    return;
-  }
+  socket.on('join', ({ roomId, userId }) => {
+    if (!rooms.has(roomId)) {
+      rooms.set(roomId, new Set());
+    }
+    rooms.get(roomId).add({ socket, userId });
+    socket.roomId = roomId;
+    socket.userId = userId;
 
-  if (!rooms.has(roomId)) rooms.set(roomId, new Set());
-  rooms.get(roomId).add(ws);
-  ws.roomId = roomId;
-
-  ws.on('message', (msg) => {
-    // Broadcast to others in the room
-    for (const client of rooms.get(roomId)) {
-      if (client !== ws && client.readyState === WebSocket.OPEN) {
-        client.send(msg);
+    // Notify others in the room about the new user
+    for (const { socket: otherSocket } of rooms.get(roomId)) {
+      if (otherSocket !== socket) {
+        otherSocket.emit('user-joined', { userId });
       }
+    }
+
+    console.log(`${userId} joined room ${roomId}`);
+  });
+
+  socket.on('offer', ({ offer, to, roomId }) => {
+    const targetSocket = [...rooms.get(roomId)].find(({ userId }) => userId === to)?.socket;
+    if (targetSocket) {
+      targetSocket.emit('offer', { offer, from: socket.userId });
     }
   });
 
-  ws.on('close', () => {
-    rooms.get(roomId)?.delete(ws);
-    if (rooms.get(roomId)?.size === 0) rooms.delete(roomId);
+  socket.on('answer', ({ answer, to, roomId }) => {
+    const targetSocket = [...rooms.get(roomId)].find(({ userId }) => userId === to)?.socket;
+    if (targetSocket) {
+      targetSocket.emit('answer', { answer, from: socket.userId });
+    }
+  });
+
+  socket.on('candidate', ({ candidate, to, roomId }) => {
+    const targetSocket = [...rooms.get(roomId)].find(({ userId }) => userId === to)?.socket;
+    if (targetSocket) {
+      targetSocket.emit('candidate', { candidate, from: socket.userId });
+    }
+  });
+
+  socket.on('leave', ({ roomId, userId }) => {
+    if (rooms.get(roomId)) {
+      rooms.get(roomId).delete([...rooms.get(roomId)].find(({ userId: id }) => id === userId));
+      for (const { socket: otherSocket } of rooms.get(roomId)) {
+        otherSocket.emit('user-left', { userId });
+      }
+      if (rooms.get(roomId).size === 0) {
+        rooms.delete(roomId);
+      }
+    }
+    socket.disconnect();
+  });
+
+  socket.on('disconnect', () => {
+    if (socket.roomId && rooms.get(socket.roomId)) {
+      rooms.get(socket.roomId).delete([...rooms.get(socket.roomId)].find(({ userId }) => userId === socket.userId));
+      for (const { socket: otherSocket } of rooms.get(socket.roomId)) {
+        otherSocket.emit('user-left', { userId: socket.userId });
+      }
+      if (rooms.get(socket.roomId)?.size === 0) {
+        rooms.delete(socket.roomId);
+      }
+    }
+    console.log(`Disconnected: ${socket.id}`);
   });
 });
 
